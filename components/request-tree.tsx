@@ -2,7 +2,7 @@
 
 import { useState } from "react"
 import { ChevronRight, ChevronDown, FileText } from "lucide-react"
-import type { CollectionType, RequestItem } from "@/types/collection"
+import type { CollectionType, RequestItem } from "@/app/types/collection"
 import { Badge } from "@/components/ui/badge"
 
 interface RequestTreeProps {

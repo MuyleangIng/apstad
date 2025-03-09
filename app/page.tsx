@@ -1,12 +1,11 @@
 "use client"
 
 import { useState, useEffect } from "react"
-import { Send, Plus, Trash2, FolderPlus, Server } from "lucide-react"
+import { Send, Plus, Trash2, FolderPlus, Server, Globe } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-import { Textarea } from "@/components/ui/textarea"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Switch } from "@/components/ui/switch"
@@ -16,13 +15,18 @@ import { AgentStatus } from "@/components/agent-status"
 import { ServerTester } from "@/components/server-tester"
 import { CollectionImporter } from "@/components/collection-importer"
 import { RequestTree } from "@/components/request-tree"
-import type { CollectionType, RequestItem } from "@/types/collection"
+import type { CollectionType, RequestItem } from "@/app/types/collection"
+import { RequestManager, type SavedRequest } from "@/components/request-manager"
+import { JsonEditor } from "@/components/json-editor"
+import { AuthHeader } from "@/components/auth-header"
 
 export default function ApiTesterWithFolders() {
   const [url, setUrl] = useState("http://localhost:8000/articles/")
   const [method, setMethod] = useState("GET")
+  const [bearerToken, setBearerToken] = useState("")
   const [headers, setHeaders] = useState<{ key: string; value: string }[]>([
     { key: "Content-Type", value: "application/json" },
+    { key: "Authorization", value: "" },
   ])
   const [requestBody, setRequestBody] = useState('{\n  "key": "value"\n}')
   const [response, setResponse] = useState<{
@@ -76,8 +80,8 @@ export default function ApiTesterWithFolders() {
           })
         }
 
-        // Ensure URL starts with http://localhost
-        if (!processedUrl.startsWith("http://localhost") && !processedUrl.startsWith("https://localhost")) {
+        // Ensure URL starts with http://localhost or https://
+        if (!processedUrl.startsWith("http://") && !processedUrl.startsWith("https://")) {
           processedUrl = `${baseUrl}${processedUrl.startsWith("/") ? processedUrl : "/" + processedUrl}`
         }
 
@@ -106,6 +110,17 @@ export default function ApiTesterWithFolders() {
       }
     }
   }, [selectedRequest, collection, baseUrl])
+
+  useEffect(() => {
+    if (bearerToken) {
+      const authHeader = headers.find((h) => h.key === "Authorization")
+      if (authHeader) {
+        updateHeader(headers.indexOf(authHeader), "value", `Bearer ${bearerToken}`)
+      } else {
+        setHeaders([...headers, { key: "Authorization", value: `Bearer ${bearerToken}` }])
+      }
+    }
+  }, [bearerToken])
 
   const addHeader = () => {
     setHeaders([...headers, { key: "", value: "" }])
@@ -161,8 +176,8 @@ export default function ApiTesterWithFolders() {
     })
   }
 
-  // Helper function to ensure URL is properly formatted for the agent
-  const formatUrlForAgent = (inputUrl: string): string => {
+  // Helper function to ensure URL is properly formatted
+  const formatUrl = (inputUrl: string): string => {
     let formattedUrl = inputUrl.trim()
 
     // If URL doesn't have a protocol, add http://
@@ -180,14 +195,69 @@ export default function ApiTesterWithFolders() {
     }
   }
 
-  const sendRequest = async () => {
-    if (!agentConnected) {
-      setResponse({
-        error: "Local agent is not connected. Please start the agent application.",
-      })
-      return
+  // Check if URL is a localhost URL
+  const isLocalhostUrl = (url: string): boolean => {
+    try {
+      const parsedUrl = new URL(url)
+      return (
+        parsedUrl.hostname === "localhost" ||
+        parsedUrl.hostname === "127.0.0.1" ||
+        parsedUrl.hostname.startsWith("192.168.") ||
+        parsedUrl.hostname.startsWith("10.")
+      )
+    } catch (error) {
+      return false
+    }
+  }
+
+  // Make a direct request without using the agent
+  const makeDirectRequest = async (
+    targetUrl: string,
+    requestMethod: string,
+    requestHeaders: Record<string, string>,
+    requestData: any,
+  ) => {
+    const options: RequestInit = {
+      method: requestMethod,
+      headers: requestHeaders,
+      credentials: "include",
     }
 
+    // Add body for non-GET/DELETE requests
+    if (requestMethod !== "GET" && requestMethod !== "DELETE" && requestData) {
+      options.body = typeof requestData === "string" ? requestData : JSON.stringify(requestData)
+    }
+
+    const response = await fetch(targetUrl, options)
+
+    // Extract headers
+    const responseHeaders: Record<string, string> = {}
+    response.headers.forEach((value, key) => {
+      responseHeaders[key] = value
+    })
+
+    // Parse response data based on content type
+    let responseData
+    const contentType = response.headers.get("content-type") || ""
+
+    if (contentType.includes("application/json")) {
+      responseData = await response.json()
+    } else if (contentType.includes("text/")) {
+      responseData = await response.text()
+    } else {
+      // For binary data, just indicate it was received
+      responseData = "[Binary data received]"
+    }
+
+    return {
+      status: response.status,
+      statusText: response.statusText,
+      headers: responseHeaders,
+      data: responseData,
+    }
+  }
+
+  const sendRequest = async () => {
     setLoading(true)
     const startTime = Date.now()
 
@@ -211,30 +281,48 @@ export default function ApiTesterWithFolders() {
         generateFolderStructure()
       }
 
-      // Format URL for agent
-      const targetUrl = formatUrlForAgent(url)
+      // Format URL
+      const targetUrl = formatUrl(url)
       console.log("Sending request to:", targetUrl)
 
-      // Send request to local agent
-      const res = await fetch("http://localhost:5001/proxy", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          url: targetUrl,
-          method,
-          headers: headerObj,
-          body: method !== "GET" && method !== "DELETE" ? parsedBody : undefined,
-        }),
-      })
+      let data
 
-      if (!res.ok) {
-        const errorText = await res.text()
-        throw new Error(`Agent returned status ${res.status}: ${errorText}`)
+      // Check if URL is localhost - use agent if available, otherwise make direct request
+      if (isLocalhostUrl(targetUrl)) {
+        if (!agentConnected) {
+          throw new Error("Local agent is not connected. For localhost URLs, please start the agent application.")
+        }
+
+        // Send request to local agent
+        const res = await fetch("http://localhost:5001/proxy", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            url: targetUrl,
+            method,
+            headers: headerObj,
+            body: method !== "GET" && method !== "DELETE" ? parsedBody : undefined,
+          }),
+        })
+
+        if (!res.ok) {
+          const errorText = await res.text()
+          throw new Error(`Agent returned status ${res.status}: ${errorText}`)
+        }
+
+        data = await res.json()
+      } else {
+        // For non-localhost URLs, make direct request
+        data = await makeDirectRequest(
+          targetUrl,
+          method,
+          headerObj,
+          method !== "GET" && method !== "DELETE" ? parsedBody : undefined,
+        )
       }
 
-      const data = await res.json()
       const endTime = Date.now()
 
       setResponse({
@@ -247,10 +335,20 @@ export default function ApiTesterWithFolders() {
     } catch (error) {
       console.error("Request error:", error)
       setResponse({
-        error: error instanceof Error ? error.message : "Failed to connect to local agent. Make sure it's running.",
+        error: error instanceof Error ? error.message : "Failed to make request",
       })
     } finally {
       setLoading(false)
+    }
+  }
+
+  const handleLoadRequest = (request: SavedRequest) => {
+    setUrl(request.url)
+    setMethod(request.method)
+    setHeaders(request.headers)
+    setRequestBody(request.body)
+    if (request.bearerToken) {
+      setBearerToken(request.bearerToken)
     }
   }
 
@@ -258,7 +356,7 @@ export default function ApiTesterWithFolders() {
     <div className="container mx-auto py-6">
       <div className="flex justify-between items-center mb-6">
         <h1 className="text-3xl font-bold">API & Collection Tester</h1>
-        <AgentStatus connected={agentConnected} />
+        <AgentStatus connected={agentConnected} onCheckConnection={checkAgentStatus} />
       </div>
 
       <div className="grid grid-cols-12 gap-6">
@@ -270,33 +368,48 @@ export default function ApiTesterWithFolders() {
               <CardDescription>Import and manage API collections</CardDescription>
             </CardHeader>
             <CardContent>
-              <div className="mb-4">
-                <Label htmlFor="base-url">Base URL</Label>
-                <div className="flex space-x-2 mt-1">
-                  <Input
-                    id="base-url"
-                    value={baseUrl}
-                    onChange={(e) => setBaseUrl(e.target.value)}
-                    placeholder="http://localhost:8000"
-                  />
-                  <Button variant="outline" size="sm" onClick={() => setUrl(`${baseUrl}/articles/`)}>
-                    <Server className="h-4 w-4 mr-2" /> Set
-                  </Button>
+              <div className="space-y-4">
+                <AuthHeader value={bearerToken} onChange={setBearerToken} />
+
+                <RequestManager
+                  onLoadRequest={handleLoadRequest}
+                  currentRequest={{
+                    url,
+                    method,
+                    headers,
+                    body: requestBody,
+                    bearerToken,
+                  }}
+                />
+
+                <div className="mb-4">
+                  <Label htmlFor="base-url">Base URL</Label>
+                  <div className="flex space-x-2 mt-1">
+                    <Input
+                      id="base-url"
+                      value={baseUrl}
+                      onChange={(e) => setBaseUrl(e.target.value)}
+                      placeholder="http://localhost:8000"
+                    />
+                    <Button variant="outline" size="sm" onClick={() => setUrl(`${baseUrl}/articles/`)}>
+                      <Server className="h-4 w-4 mr-2" /> Set
+                    </Button>
+                  </div>
                 </div>
-              </div>
 
-              <ServerTester baseUrl={baseUrl} />
+                <ServerTester baseUrl={baseUrl} />
 
-              <div className="mt-4">
-                <CollectionImporter onImport={handleCollectionImport} />
-              </div>
+                <div className="mt-4">
+                  <CollectionImporter onImport={handleCollectionImport} />
+                </div>
 
-              <div className="mt-4">
-                {collection ? (
-                  <RequestTree collection={collection} onSelectRequest={setSelectedRequest} />
-                ) : (
-                  <div className="text-center p-8 text-muted-foreground">Import a collection to see requests</div>
-                )}
+                <div className="mt-4">
+                  {collection ? (
+                    <RequestTree collection={collection} onSelectRequest={setSelectedRequest} />
+                  ) : (
+                    <div className="text-center p-8 text-muted-foreground">Import a collection to see requests</div>
+                  )}
+                </div>
               </div>
             </CardContent>
           </Card>
@@ -337,8 +450,13 @@ export default function ApiTesterWithFolders() {
                     </Button>
                   </div>
 
-                  <div className="text-xs text-muted-foreground bg-yellow-50 p-2 rounded border border-yellow-200">
-                    <strong>Important:</strong> Make sure your FastAPI server is running and accessible at the Base URL
+                  <div className="flex items-center space-x-2 bg-muted p-2 rounded">
+                    <Globe className="h-4 w-4 text-muted-foreground" />
+                    <span className="text-xs text-muted-foreground">
+                      {isLocalhostUrl(url)
+                        ? "Using local agent for localhost URL (agent must be running)"
+                        : "Using direct request for production domain (no agent required)"}
+                    </span>
                   </div>
 
                   <div className="flex items-center space-x-2 pt-2">
@@ -392,12 +510,7 @@ export default function ApiTesterWithFolders() {
                       </Button>
                     </TabsContent>
                     <TabsContent value="body" className="mt-4">
-                      <Textarea
-                        placeholder="Request body (JSON)"
-                        value={requestBody}
-                        onChange={(e) => setRequestBody(e.target.value)}
-                        className="font-mono h-[300px]"
-                      />
+                      <JsonEditor value={requestBody} onChange={setRequestBody} className="h-[300px]" />
                     </TabsContent>
                     <TabsContent value="folders" className="mt-4">
                       {folderStructure.length > 0 ? (
